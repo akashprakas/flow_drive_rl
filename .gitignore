@@ -1,0 +1,107 @@
+# Python
+*.py[cod]
+*$py.class
+**/__pycache__/
+*.so
+.pytest_cache/
+.pydevproject
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+MANIFEST
+.eggs/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.vscode/*
+.idea/
+*.swp
+*.swo
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Logs & outputs
+*.log
+*.out
+*.err
+wandb/
+lightning_logs/
+tensorboard_logs/
+runs/
+demo_local/
+ckpts/
+
+# Checkpoints & model weights
+*.ckpt
+*.pth
+*.pt
+*.h5
+*.hdf5
+
+# Data files
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.csv
+*.parquet
+*.feather
+
+# Image / sensor data
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.pcd
+*.bin
+*.las
+
+# Experiment outputs
+exp/
+output/
+outputs/
+results/
+
+# Datasets
+dataset/
+data/
+
+# Submission artifacts
+submission/
+*.tar.gz
+*.zip
+
+# LSF / job schedulers
+*.bsub
+*.lsf
+
+# Development scripts
+scripts_dev/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.temp
+*.bak
+demo/
+tutorial/
+download/
