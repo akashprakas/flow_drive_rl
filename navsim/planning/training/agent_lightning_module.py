@@ -1,3 +1,4 @@
+import inspect
 from typing import Dict, Tuple
 
 import pytorch_lightning as pl
@@ -16,6 +17,9 @@ class AgentLightningModule(pl.LightningModule):
         """
         super().__init__()
         self.agent = agent
+        # Check once at init whether this agent's forward accepts targets
+        _fwd_params = inspect.signature(self.agent.forward).parameters
+        self._forward_accepts_targets = "targets" in _fwd_params
 
     def _step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], logging_prefix: str) -> Tensor:
         """
@@ -24,11 +28,34 @@ class AgentLightningModule(pl.LightningModule):
         :param logging_prefix: prefix where to log step
         :return: scalar loss
         """
-        features, targets = batch
-        prediction = self.agent.forward(features)
-        loss = self.agent.compute_loss(features, targets, prediction)
-        self.log(f"{logging_prefix}/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        return loss
+        if len(batch) == 2:
+            features, targets = batch
+        else:
+            features, targets, pdm_token_path, token = batch
+
+        if self._forward_accepts_targets:
+            prediction = self.agent.forward(features, targets)
+        else:
+            prediction = self.agent.forward(features)
+
+        loss_or_dict = self.agent.compute_loss(features, targets, prediction)
+
+        # Support agents that return a scalar loss (legacy) or a dict (diffusiondrive-style)
+        if isinstance(loss_or_dict, dict):
+            loss_dict = loss_or_dict
+        else:
+            loss_dict = {"loss": loss_or_dict}
+
+        try:
+            current_batch_size = next(iter(features.values())).shape[0]
+        except (StopIteration, AttributeError):
+            current_batch_size = 1
+
+        for k, v in loss_dict.items():
+            if v is not None:
+                self.log(f"{logging_prefix}/{k}", v, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=current_batch_size)
+
+        return loss_dict["loss"]
 
     def training_step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], batch_idx: int) -> Tensor:
         """

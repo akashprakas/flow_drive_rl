@@ -364,9 +364,9 @@ def main(cfg: DictConfig) -> None:
 
     pdm_score_df = pd.concat(score_rows)
 
+    all_mappings: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
     try:
         raw_mapping = cfg.train_test_split.reactive_all_mapping
-        all_mappings: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
 
         for orig_token, prev_token, two_stage_pairs in raw_mapping:
             if prev_token in set(scene_loader.tokens) or orig_token in set(scene_loader.tokens):
