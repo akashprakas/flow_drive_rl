@@ -52,3 +52,20 @@ source setup_env.sh && python navsim/planning/script/run_pdm_score.py \
     metric_cache_path=$(pwd)/exp/metric_cache_mini \
     worker.threads_per_node=4
 ```
+
+
+
+
+source setup_env.sh && python navsim/planning/script/run_training.py \
+    agent=flow_agent \
+    train_test_split=navmini \
+    experiment_name=flow_agent_navmini_train \
+    cache_path=$(pwd)/exp/training_cache_mini \
+    force_cache_computation=false \
+    use_cache_without_dataset=false \
+    trainer.params.max_epochs=20 \
+    trainer.params.accelerator=gpu \
+    trainer.params.strategy=auto \
+    trainer.params.precision=32 \
+    dataloader.params.batch_size=16 \
+    dataloader.params.num_workers=2

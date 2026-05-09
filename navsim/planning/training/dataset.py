@@ -155,6 +155,13 @@ class Dataset(torch.utils.data.Dataset):
         if self._cache_path is not None:
             self.cache_dataset()
 
+        # After caching, build a stable ordered list of only the successfully cached tokens.
+        # This ensures __len__ / __getitem__ never reference tokens that were skipped.
+        self._cached_tokens: List[str] = (
+            list(self._valid_cache_paths.keys()) if self._cache_path is not None
+            else self._scene_loader.tokens
+        )
+
     @staticmethod
     def _load_valid_caches(
         cache_path: Optional[Path],
@@ -252,13 +259,16 @@ class Dataset(torch.utils.data.Dataset):
             )
 
         for token in tqdm(tokens_to_cache, desc="Caching Dataset"):
-            self._cache_scene_with_token(token)
+            try:
+                self._cache_scene_with_token(token)
+            except Exception:
+                logger.warning(f"Skipping token {token} due to error during caching.")
 
-    def __len__(self) -> None:
+    def __len__(self) -> int:
         """
         :return: number of samples to load
         """
-        return len(self._scene_loader)
+        return len(self._cached_tokens)
 
     def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
@@ -267,7 +277,7 @@ class Dataset(torch.utils.data.Dataset):
         :return: tuple of feature and target dictionary
         """
 
-        token = self._scene_loader.tokens[idx]
+        token = self._cached_tokens[idx]
         features: Dict[str, torch.Tensor] = {}
         targets: Dict[str, torch.Tensor] = {}
 

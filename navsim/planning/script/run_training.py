@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 from typing import Tuple
 
+import torch
 import hydra
 import pytorch_lightning as pl
 from hydra.utils import instantiate
@@ -84,6 +85,7 @@ def main(cfg: DictConfig) -> None:
     :param cfg: omegaconf dictionary
     """
 
+    torch.set_float32_matmul_precision("high")
     pl.seed_everything(cfg.seed, workers=True)
     logger.info(f"Global Seed set to {cfg.seed}")
 

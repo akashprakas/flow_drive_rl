@@ -10,6 +10,7 @@ from navsim.agents.abstract_agent import AbstractAgent
 from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 from navsim.agents.flow_drive_agent.flow_model import FlowTransfuserModel
 from navsim.agents.diffusiondrive.transfuser_callback import TransfuserCallback
+from pytorch_lightning.callbacks import ModelCheckpoint
 from navsim.agents.diffusiondrive.transfuser_loss import transfuser_loss
 from navsim.agents.diffusiondrive.transfuser_features import TransfuserFeatureBuilder, TransfuserTargetBuilder
 from navsim.common.dataclasses import SensorConfig
@@ -149,4 +150,11 @@ class FlowAgent(AbstractAgent):
         return {'optimizer': optimizer, 'lr_scheduler': scheduler}
 
     def get_training_callbacks(self) -> List[pl.Callback]:
-        return [TransfuserCallback(self._config)]
+        best_ckpt = ModelCheckpoint(
+            monitor="val/loss",
+            mode="min",
+            save_top_k=1,
+            filename="best",
+            save_last=True,
+        )
+        return [TransfuserCallback(self._config), best_ckpt]
