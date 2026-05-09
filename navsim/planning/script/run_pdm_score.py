@@ -314,8 +314,9 @@ def create_scene_aggregators(
 
         all_updates.append(updated_rows)
 
-    all_updates_df = pd.concat(all_updates, ignore_index=True).set_index("token")
-    full_score_df.update(all_updates_df)
+    all_updates_df = pd.concat(all_updates, ignore_index=True).set_index("token") if all_updates else pd.DataFrame()
+    if not all_updates_df.empty:
+        full_score_df.update(all_updates_df)
     full_score_df.reset_index(inplace=True)
     full_score_df = full_score_df.drop(columns=["ego_simulated_states"])
 
@@ -375,7 +376,21 @@ def main(cfg: DictConfig) -> None:
         pdm_score_df = create_scene_aggregators(
             all_mappings, pdm_score_df, instantiate(cfg.simulator.proposal_sampling)
         )
-        pdm_score_df = compute_final_scores(pdm_score_df)
+        # Fill NaNs for scenes not covered by any two-stage mapping (e.g. navmini has no reactive scenarios)
+        pdm_score_df["two_frame_extended_comfort"] = pdm_score_df.get("two_frame_extended_comfort", pd.Series(0.0, index=pdm_score_df.index)).fillna(0.0)
+        pdm_score_df["weight"] = pdm_score_df.get("weight", pd.Series(1.0, index=pdm_score_df.index)).fillna(1.0)
+        # Only compute final scores for valid rows (failed rows have malformed weighted_metrics)
+        valid_mask = pdm_score_df["valid"].astype(bool)
+        drop_cols = ["weighted_metrics", "weighted_metrics_array", "multiplicative_metrics_prod"]
+        if valid_mask.any():
+            valid_df = compute_final_scores(pdm_score_df[valid_mask].copy())
+            invalid_df = pdm_score_df[~valid_mask].copy()
+            invalid_df["score"] = 0.0
+            invalid_df.drop(columns=[c for c in drop_cols if c in invalid_df.columns], inplace=True)
+            pdm_score_df = pd.concat([valid_df, invalid_df], ignore_index=True)
+        else:
+            pdm_score_df.drop(columns=[c for c in drop_cols if c in pdm_score_df.columns], inplace=True)
+            pdm_score_df["score"] = 0.0
         pseudo_closed_loop_valid = True
 
     except Exception:
@@ -444,7 +459,7 @@ def main(cfg: DictConfig) -> None:
     combined_row = pd.Series(index=pdm_score_df.columns, dtype=object)
     combined_row["token"] = "extended_pdm_score_combined"
     combined_row["valid"] = pseudo_closed_loop_valid
-    combined_row["score"] = pcl_group_score["score"]
+    combined_row["score"] = pcl_group_score.get("score", np.nan)
 
     for col in pcl_stage1_score.index:
         if col not in ["token", "valid", "score"]:
