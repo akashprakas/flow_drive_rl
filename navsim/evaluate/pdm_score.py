@@ -10,11 +10,11 @@ from nuplan.planning.simulation.planner.ml_planner.transform_utils import (
     _get_fixed_timesteps,
     _se2_vel_acc_to_ego_state,
 )
-from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import WeightedMetricIndex
+from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import MultiMetricIndex, WeightedMetricIndex
 from nuplan.planning.simulation.trajectory.interpolated_trajectory import InterpolatedTrajectory
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
-from navsim.common.dataclasses import Trajectory
+from navsim.common.dataclasses import PDMResults, Trajectory
 from navsim.common.enums import SceneFrameType
 from navsim.planning.metric_caching.metric_cache import MetricCache
 from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer
@@ -219,3 +219,119 @@ def pdm_score_from_interpolated_trajectory(
             pdm_result.at[0, "weighted_metrics"] = weighted_metrics
             
     return pdm_result, simulated_states[pred_idx]
+
+
+
+from typing import Sequence, Tuple, Union, List
+import numpy as np
+
+def _pdm_score_single(
+    metric_cache: MetricCache,
+    model_trajectory: Trajectory,
+    future_sampling: TrajectorySampling,
+    simulator: PDMSimulator,
+    scorer: PDMScorer,
+) -> Tuple[pd.DataFrame, np.ndarray]:
+    """Single-trajectory scoring. Returns (pd.DataFrame result, simulated ego states array)."""
+    initial_ego_state = metric_cache.ego_state
+
+    pdm_trajectory = metric_cache.trajectory
+    pred_trajectory = transform_trajectory(model_trajectory, initial_ego_state)
+
+    pdm_states, pred_states = (
+        get_trajectory_as_array(pdm_trajectory,
+                                future_sampling,
+                                initial_ego_state.time_point),
+        get_trajectory_as_array(pred_trajectory,
+                                future_sampling,
+                                initial_ego_state.time_point),
+    )
+
+    trajectory_states = np.concatenate([pdm_states[None, ...],
+                                        pred_states[None, ...]],
+                                       axis=0)
+
+    simulated_states = simulator.simulate_proposals(
+        trajectory_states, initial_ego_state)
+
+    results = scorer.score_proposals(
+        simulated_states,
+        metric_cache.observation,
+        metric_cache.centerline,
+        metric_cache.route_lane_ids,
+        metric_cache.drivable_area_map,
+    )
+
+    pred_idx = 1
+    return results[pred_idx], simulated_states[pred_idx]
+
+# ---- Unified entry point for both single and batch trajectory scoring -------
+def pdm_score_para(
+    metric_cache: MetricCache,
+    model_trajectory: Union[
+        Trajectory,
+        Sequence[Trajectory],
+        np.ndarray,               # (N, T+1, 3)
+    ],
+    future_sampling: TrajectorySampling,
+    simulator: PDMSimulator,
+    scorer: PDMScorer,
+) -> Union[Tuple[pd.DataFrame, np.ndarray], Tuple[List[pd.DataFrame], np.ndarray]]:
+    """
+    * If `model_trajectory` is a **single** Trajectory → returns (pd.DataFrame, simulated_states)
+    * If `model_trajectory` is a **batch** (list / ndarray) → returns (List[pd.DataFrame], simulated_states[1:]), length = N
+    """
+    # --------- Single trajectory: use single-trajectory implementation ----------
+    if isinstance(model_trajectory, Trajectory):
+        return _pdm_score_single(metric_cache,
+                                 model_trajectory,
+                                 future_sampling,
+                                 simulator,
+                                 scorer)
+
+    # --------- Parse batch input -------------------
+    if isinstance(model_trajectory, np.ndarray):
+        # ndarray ⇒ list[Trajectory], assumes last two dims are (T+1, 3)
+        traj_list = [Trajectory(model_trajectory[i])
+                     for i in range(model_trajectory.shape[0])]
+    else:
+        # Already a list[Trajectory]
+        traj_list = list(model_trajectory)
+
+    N = len(traj_list)
+    if N == 0:
+        raise ValueError("Empty trajectory batch.")
+
+    initial_ego_state = metric_cache.ego_state
+    pdm_trajectory    = metric_cache.trajectory
+    pdm_states        = get_trajectory_as_array(
+        pdm_trajectory, future_sampling, initial_ego_state.time_point)
+
+    # —— Convert N predicted trajectories to (N, T+1, dim) ----------
+    pred_states_batch = []
+    for traj in traj_list:
+        pred_world = transform_trajectory(traj, initial_ego_state)
+        pred_states = get_trajectory_as_array(
+            pred_world, future_sampling, initial_ego_state.time_point)
+        pred_states_batch.append(pred_states)
+    pred_states_batch = np.stack(pred_states_batch, axis=0)      # (N, T+1, dim)
+
+    # —— Concatenate into (N+1, T+1, dim), index 0 is the GT/PDM reference ----------
+    trajectory_states = np.concatenate(
+        [pdm_states[None, ...], pred_states_batch], axis=0)
+
+    # —— Single simulation pass + single scoring pass ------------------------
+    simulated_states = simulator.simulate_proposals(
+        trajectory_states, initial_ego_state)
+
+    results = scorer.score_proposals(
+        simulated_states,
+        metric_cache.observation,
+        metric_cache.centerline,
+        metric_cache.route_lane_ids,
+        metric_cache.drivable_area_map,
+    )
+
+    # results[0] is the GT/PDM reference; results[1:] are the N predictions
+    sim_pred = simulated_states[1:]
+    return results[1:], sim_pred

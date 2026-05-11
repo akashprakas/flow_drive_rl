@@ -31,8 +31,117 @@ from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PD
 from navsim.planning.metric_caching.metric_cache import MetricCache
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 from navsim.common.dataclasses import Trajectory
+from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import MultiMetricIndex, WeightedMetricIndex
+from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import (
+    WeightedMetricIndex as WIdx,
+)
+#copied diffusiondrive v2
+def _pairwise_subscores(scorer):
+    """
+    Extract all individual sub-scores from a PDMScorer that has already run
+    score_proposals() in batch mode.
 
-from navsim.agents.diffusiondrivev2.diffusiondrivev2_model_rl import _pairwise_scores, _pairwise_subscores
+    Replicates the same GT-relative progress normalization as _pairwise_scores
+    so that each sub-metric value is consistent with the final scalar score.
+    Index 0 in the scorer is always the GT/reference trajectory; the returned
+    arrays are sliced to [1:] so they align with candidate proposals only.
+
+    Returns:
+        dict[str, np.ndarray], each of shape (G,) where G = num_proposals - 1.
+        Keys: no_collision, drivable_area, progress, ttc, comfort,
+              dir_weighted, final.
+    """
+    mm   = scorer._multi_metrics                # (3, N) — binary multiplicative metrics
+    wm   = scorer._weighted_metrics.copy()      # must copy before modifying progress in-place
+    prod = mm.prod(axis=0)                      # (N,) — product of all multiplicative metrics
+
+    wcoef  = scorer._config.weighted_metrics_array
+    thresh = scorer._config.progress_distance_threshold
+    prog_raw = scorer._progress_raw             # (N,) — raw ego progress values
+
+    # Normalize progress relative to GT (index 0), matching _pairwise_scores exactly.
+    # If max(gt_prog, proposal_prog) > threshold: normalize by that max.
+    # Otherwise: 0 if there was a collision/infraction, 1 if the car was stationary.
+    raw_prog    = prog_raw * prod
+    raw_prog_gt = raw_prog[0]
+    max_pair    = np.maximum(raw_prog_gt, raw_prog[1:])
+    norm_prog   = np.where(
+        max_pair > thresh,
+        raw_prog[1:] / (max_pair + 1e-6),
+        np.where(prod[1:] == 0.0, 0.0, 1.0),
+    ).astype(np.float64)
+    wm[WeightedMetricIndex.PROGRESS, 1:] = norm_prog
+
+    # Weighted combination of soft metrics (TTC, comfort, progress, driving direction)
+    wscore = (wm * wcoef[:, None]).sum(axis=0) / wcoef.sum()
+
+    return {
+        "no_collision"  : mm[MultiMetricIndex.NO_COLLISION,        1:].copy(),
+        "drivable_area" : mm[MultiMetricIndex.DRIVABLE_AREA,       1:].copy(),  # multiplicative binary
+        "progress"      : wm[WeightedMetricIndex.PROGRESS,         1:].copy(),
+        "ttc"           : wm[WeightedMetricIndex.TTC,              1:].copy(),
+        "comfort"       : wm[WeightedMetricIndex.COMFORTABLE,      1:].copy(),
+        "dir_weighted"  : wm[WeightedMetricIndex.DRIVING_DIRECTION,1:].copy(),
+        "final"         : prod[1:] * wscore[1:],                                # overall PDM score
+    }
+
+#copied diffusiondrive v2
+def _pairwise_scores(scorer) -> np.ndarray:
+    """
+    Recompute per-proposal PDM scores using the intermediate state cached by
+    a PDMScorer after score_proposals() has been called in batch mode.
+
+    The scorer is called once with [GT, proposal_0, ..., proposal_G] stacked
+    together. This function pulls out the cached tensors and re-derives each
+    proposal's final score relative to the GT trajectory at index 0, mirroring
+    the internal _aggregate_scores logic.
+
+    Args:
+        scorer: PDMScorer instance with populated _multi_metrics,
+                _weighted_metrics, and _progress_raw after score_proposals().
+
+    Returns:
+        np.ndarray of shape (N-1,) float32 — one PDM score per proposal (GT excluded).
+    """
+    # Retrieve cached intermediate tensors from the scorer
+    mm   = scorer._multi_metrics            # (M_mul, N) — binary multiplicative metrics
+    wm   = scorer._weighted_metrics.copy()  # (M_wgt, N) — copy so we can overwrite progress
+    prog_raw = scorer._progress_raw         # (N,) — unnormalized ego progress distances
+    weight_coef = scorer._config.weighted_metrics_array  # (M_wgt,) — per-metric weights
+
+    N = mm.shape[1]                         # total proposals = 1 (GT) + G candidates
+    assert N >= 2, "Need at least GT + 1 proposal"
+
+    # Product of all binary multiplicative metrics (no_collision × drivable_area × ...)
+    multi_prod = mm.prod(axis=0)            # (N,)
+
+    # Normalize progress for each candidate relative to GT only.
+    # This differs from the default scorer behavior which normalizes globally.
+    raw_prog    = prog_raw * multi_prod     # zero out progress if any binary metric failed
+    raw_prog_gt = raw_prog[0]
+
+    max_pair    = np.maximum(raw_prog_gt, raw_prog[1:])           # (G,)
+    thresh      = scorer._config.progress_distance_threshold
+
+    # If the larger of (gt_prog, proposal_prog) exceeds threshold: use ratio.
+    # Otherwise: 0 if proposal had a collision/infraction, 1 if both were stationary.
+    norm_prog   = np.where(
+        max_pair > thresh,
+        raw_prog[1:] / (max_pair + 1e-6),
+        np.where(multi_prod[1:] == 0.0, 0.0, 1.0),
+    ).astype(np.float64)                                         # (G,)
+
+    # Overwrite the progress row with the GT-relative normalized values
+    wm[WIdx.PROGRESS, 1:] = norm_prog
+
+    # Weighted sum of soft metrics (matches PDMScorer._aggregate_scores)
+    weighted_scores = (wm[:, 1:] * weight_coef[:, None]).sum(axis=0)
+    weighted_scores /= weight_coef.sum()                         # (G,)
+
+    # Final PDM score = product of binary metrics × weighted soft metric score
+    final_scores = multi_prod[1:] * weighted_scores              # (G,)
+
+    return final_scores.astype(np.float32)                       # (G,)
 
 
 class FlowRLTransfuserModel(nn.Module):
