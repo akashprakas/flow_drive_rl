@@ -376,8 +376,10 @@ def main(cfg: DictConfig) -> None:
         pdm_score_df = create_scene_aggregators(
             all_mappings, pdm_score_df, instantiate(cfg.simulator.proposal_sampling)
         )
-        # Fill NaNs for scenes not covered by any two-stage mapping (e.g. navmini has no reactive scenarios)
-        pdm_score_df["two_frame_extended_comfort"] = pdm_score_df.get("two_frame_extended_comfort", pd.Series(0.0, index=pdm_score_df.index)).fillna(0.0)
+        # Fill NaNs for scenes not covered by any two-stage mapping (e.g. navtest/navmini have no reactive scenarios).
+        # Default to 1.0 (perfect comfort) — the SceneAggregator only lowers comfort when it detects
+        # a jerk/acceleration violation across consecutive frames. Without mappings, assume comfortable.
+        pdm_score_df["two_frame_extended_comfort"] = pdm_score_df.get("two_frame_extended_comfort", pd.Series(1.0, index=pdm_score_df.index)).fillna(1.0)
         pdm_score_df["weight"] = pdm_score_df.get("weight", pd.Series(1.0, index=pdm_score_df.index)).fillna(1.0)
         # Only compute final scores for valid rows (failed rows have malformed weighted_metrics)
         valid_mask = pdm_score_df["valid"].astype(bool)
