@@ -112,12 +112,14 @@ def main(cfg: DictConfig) -> None:
             feature_builders=agent.get_feature_builders(),
             target_builders=agent.get_target_builders(),
             log_names=cfg.train_logs,
+            metric_cache_path=cfg.get("metric_cache_path", None),
         )
         val_data = CacheOnlyDataset(
             cache_path=cfg.cache_path,
             feature_builders=agent.get_feature_builders(),
             target_builders=agent.get_target_builders(),
             log_names=cfg.val_logs,
+            metric_cache_path=cfg.get("metric_cache_path", None),
         )
     else:
         logger.info("Building SceneLoader")

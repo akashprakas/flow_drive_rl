@@ -37,7 +37,7 @@ class FlowRLAgent(AbstractAgent):
         lr: float,
         checkpoint_path: Optional[str] = None,
     ):
-        super().__init__()
+        super().__init__(trajectory_sampling=config.trajectory_sampling)
 
         self._config = config
         self._lr = lr

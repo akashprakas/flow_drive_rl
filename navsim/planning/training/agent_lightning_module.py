@@ -17,9 +17,10 @@ class AgentLightningModule(pl.LightningModule):
         """
         super().__init__()
         self.agent = agent
-        # Check once at init whether this agent's forward accepts targets
+        # Check once at init whether this agent's forward accepts targets / metric cache
         _fwd_params = inspect.signature(self.agent.forward).parameters
         self._forward_accepts_targets = "targets" in _fwd_params
+        self._forward_accepts_metric_cache = "metric_cache_path" in _fwd_params
 
     def _step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], logging_prefix: str) -> Tensor:
         """
@@ -30,10 +31,13 @@ class AgentLightningModule(pl.LightningModule):
         """
         if len(batch) == 2:
             features, targets = batch
+            pdm_token_path, token = None, None
         else:
             features, targets, pdm_token_path, token = batch
 
-        if self._forward_accepts_targets:
+        if self._forward_accepts_metric_cache and pdm_token_path is not None:
+            prediction = self.agent.forward(features, targets, metric_cache_path=pdm_token_path, token=token)
+        elif self._forward_accepts_targets:
             prediction = self.agent.forward(features, targets)
         else:
             prediction = self.agent.forward(features)

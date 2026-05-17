@@ -43,8 +43,9 @@ def _pairwise_subscores(scorer):
 
     Replicates the same GT-relative progress normalization as _pairwise_scores
     so that each sub-metric value is consistent with the final scalar score.
-    Index 0 in the scorer is always the GT/reference trajectory; the returned
-    arrays are sliced to [1:] so they align with candidate proposals only.
+    Index 0 in the scorer is the PDM reference trajectory inserted by
+    pdm_score_para; the returned arrays are sliced to [1:] so they align with
+    the model trajectories passed to pdm_score_para.
 
     Returns:
         dict[str, np.ndarray], each of shape (G,) where G = num_proposals - 1.
@@ -72,17 +73,19 @@ def _pairwise_subscores(scorer):
     ).astype(np.float64)
     wm[WeightedMetricIndex.PROGRESS, 1:] = norm_prog
 
-    # Weighted combination of soft metrics (TTC, comfort, progress, driving direction)
-    wscore = (wm * wcoef[:, None]).sum(axis=0) / wcoef.sum()
+    # Exclude TWO_FRAME_EXTENDED_COMFORT (computed later by scene aggregator)
+    mask = np.ones(len(wcoef), dtype=bool)
+    mask[WeightedMetricIndex.TWO_FRAME_EXTENDED_COMFORT] = False
+    wscore = (wm[mask] * wcoef[mask, None]).sum(axis=0) / wcoef[mask].sum()
 
     return {
         "no_collision"  : mm[MultiMetricIndex.NO_COLLISION,        1:].copy(),
-        "drivable_area" : mm[MultiMetricIndex.DRIVABLE_AREA,       1:].copy(),  # multiplicative binary
+        "drivable_area" : mm[MultiMetricIndex.DRIVABLE_AREA,       1:].copy(),
         "progress"      : wm[WeightedMetricIndex.PROGRESS,         1:].copy(),
         "ttc"           : wm[WeightedMetricIndex.TTC,              1:].copy(),
-        "comfort"       : wm[WeightedMetricIndex.COMFORTABLE,      1:].copy(),
-        "dir_weighted"  : wm[WeightedMetricIndex.DRIVING_DIRECTION,1:].copy(),
-        "final"         : prod[1:] * wscore[1:],                                # overall PDM score
+        "comfort"       : wm[WeightedMetricIndex.HISTORY_COMFORT,  1:].copy(),
+        "dir_weighted"  : wm[WeightedMetricIndex.LANE_KEEPING,     1:].copy(),
+        "final"         : prod[1:] * wscore[1:],
     }
 
 #copied diffusiondrive v2
@@ -91,10 +94,9 @@ def _pairwise_scores(scorer) -> np.ndarray:
     Recompute per-proposal PDM scores using the intermediate state cached by
     a PDMScorer after score_proposals() has been called in batch mode.
 
-    The scorer is called once with [GT, proposal_0, ..., proposal_G] stacked
-    together. This function pulls out the cached tensors and re-derives each
-    proposal's final score relative to the GT trajectory at index 0, mirroring
-    the internal _aggregate_scores logic.
+    The scorer is called once with the PDM reference at index 0 followed by the
+    model trajectories. This function pulls out the cached tensors and
+    re-derives each model trajectory's final score relative to that reference.
 
     Args:
         scorer: PDMScorer instance with populated _multi_metrics,
@@ -134,9 +136,13 @@ def _pairwise_scores(scorer) -> np.ndarray:
     # Overwrite the progress row with the GT-relative normalized values
     wm[WIdx.PROGRESS, 1:] = norm_prog
 
-    # Weighted sum of soft metrics (matches PDMScorer._aggregate_scores)
-    weighted_scores = (wm[:, 1:] * weight_coef[:, None]).sum(axis=0)
-    weighted_scores /= weight_coef.sum()                         # (G,)
+    # Exclude TWO_FRAME_EXTENDED_COMFORT (computed later by scene aggregator, always 0 here)
+    mask = np.ones(len(weight_coef), dtype=bool)
+    mask[WeightedMetricIndex.TWO_FRAME_EXTENDED_COMFORT] = False
+
+    # Weighted sum of soft metrics (matches PDMScorer._aggregate_pdm_scores)
+    weighted_scores = (wm[mask, 1:] * weight_coef[mask, None]).sum(axis=0)
+    weighted_scores /= weight_coef[mask].sum()                   # (G,)
 
     # Final PDM score = product of binary metrics × weighted soft metric score
     final_scores = multi_prod[1:] * weighted_scores              # (G,)
@@ -325,7 +331,10 @@ class FlowRLTrajectoryHead(nn.Module):
             pred_trajs = trajectories[b].cpu().numpy()  # [N, 8, 3]
             all_trajs = np.concatenate([pred_trajs, gt_traj[None]], axis=0)  # [N+1, 8, 3]
 
-            pdm_score_para(
+            # Side-effect only: populates self._scorer internal state
+            # (_multi_metrics, _weighted_metrics, _progress_raw)
+            # for _pairwise_scores to extract GT-relative scores from.
+            _ = pdm_score_para(
                 metric_cache=metric_cache,
                 model_trajectory=all_trajs,
                 future_sampling=self._simulator.proposal_sampling,

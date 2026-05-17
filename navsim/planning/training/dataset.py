@@ -37,6 +37,7 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
         feature_builders: List[AbstractFeatureBuilder],
         target_builders: List[AbstractTargetBuilder],
         log_names: Optional[List[str]] = None,
+        metric_cache_path: Optional[str] = None,
     ):
         """
         Initializes the dataset module.
@@ -44,10 +45,15 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
         :param feature_builders: list of feature builders
         :param target_builders: list of target builders
         :param log_names: optional list of log folder to consider, defaults to None
+        :param metric_cache_path: optional root directory of PDM metric caches.
+            When provided, __getitem__ returns a 4-tuple:
+            (features, targets, per_sample_metric_cache_path, token).
+            Expected layout: <metric_cache_path>/<log_name>/unknown/<token>/metric_cache.pkl
         """
         super().__init__()
         assert Path(cache_path).is_dir(), f"Cache path {cache_path} does not exist!"
         self._cache_path = Path(cache_path)
+        self._metric_cache_path = Path(metric_cache_path) if metric_cache_path else None
 
         if log_names is not None:
             self.log_names = [Path(log_name) for log_name in log_names if (self._cache_path / log_name).is_dir()]
@@ -70,13 +76,23 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
         """
         return len(self.tokens)
 
-    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    def __getitem__(self, idx: int):
         """
         Loads and returns pair of feature and target dict from data.
         :param idx: index of sample to load.
-        :return: tuple of feature and target dictionary
+        :return: (features, targets) or (features, targets, metric_cache_path, token)
+            when metric_cache_path root was provided at construction.
         """
-        return self._load_scene_with_token(self.tokens[idx])
+        token = self.tokens[idx]
+        result = self._load_scene_with_token(token)
+        if self._metric_cache_path is not None:
+            token_path = self._valid_cache_paths[token]
+            log_name = token_path.parent.name
+            sample_metric_path = str(
+                self._metric_cache_path / log_name / "unknown" / token / "metric_cache.pkl"
+            )
+            return result[0], result[1], sample_metric_path, token
+        return result
 
     @staticmethod
     def _load_valid_caches(
