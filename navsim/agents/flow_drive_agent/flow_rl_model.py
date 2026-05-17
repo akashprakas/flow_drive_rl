@@ -5,6 +5,7 @@ Uses Gaussian Euler steps for stochastic policy:
   log_prob = -0.5 * ||z||^2
 """
 from typing import Dict, List, Optional
+import copy
 import numpy as np
 import pickle
 import lzma
@@ -263,6 +264,12 @@ class FlowRLTrajectoryHead(nn.Module):
         self.diff_decoder = CustomTransformerDecoder(diff_decoder_layer, 2)
         self.loss_computer = LossComputer(config)
 
+        # Frozen reference decoder for drift-MSE KL (Flow-GRPO regularization)
+        # KL(pi_theta || pi_ref) = ||mean_new - mean_ref||^2 / (2 * sigma_step^2)
+        self._ref_diff_decoder = copy.deepcopy(self.diff_decoder)
+        self._ref_diff_decoder.requires_grad_(False)
+        self.kl_ref_coeff = 0.1
+
         # PDM scorer for reward computation
         proposal_sampling = TrajectorySampling(time_horizon=4.0, interval_length=0.1)
         self._simulator = PDMSimulator(proposal_sampling)
@@ -303,6 +310,23 @@ class FlowRLTrajectoryHead(nn.Module):
         time_embed = self.time_mlp(timesteps).view(bs, 1, -1)
 
         poses_reg_list, poses_cls_list = self.diff_decoder(
+            traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape,
+            agents_query, ego_query, time_embed, status_encoding, None,
+        )
+        return poses_reg_list, poses_cls_list
+
+    def _run_decoder_ref(self, x_t_norm, t_val, ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, bs, n_modes):
+        """Run frozen reference decoder — same inputs as _run_decoder but uses _ref_diff_decoder."""
+        noisy_traj_points = self.denorm_odo(x_t_norm)
+        traj_pos_embed = gen_sineembed_for_position(noisy_traj_points, hidden_dim=64)
+        traj_pos_embed = traj_pos_embed.flatten(-2)
+        traj_feature = self.plan_anchor_encoder(traj_pos_embed)
+        traj_feature = traj_feature.view(bs, n_modes, -1)
+
+        timesteps = torch.full((bs,), int(t_val * 1000), device=x_t_norm.device, dtype=torch.long)
+        time_embed = self.time_mlp(timesteps).view(bs, 1, -1)
+
+        poses_reg_list, poses_cls_list = self._ref_diff_decoder(
             traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape,
             agents_query, ego_query, time_embed, status_encoding, None,
         )
@@ -471,10 +495,12 @@ class FlowRLTrajectoryHead(nn.Module):
         rl_loss_values = []
         il_loss_values = []
         kl_values = []
+        kl_ref_values = []
 
         for ppo_epoch in range(self.ppo_epochs):
             new_log_probs = []
             il_losses = []
+            kl_drift_per_step = []
 
             for step in range(self.n_steps):
                 t_val = self.sigma_init - step * dt
@@ -490,6 +516,21 @@ class FlowRLTrajectoryHead(nn.Module):
                 v_norm = (x_0_pred_norm - x_curr) / max(t_val, 1e-5)
                 mean = x_curr + v_norm * dt
 
+                # Drift-MSE KL to frozen reference decoder
+                # KL(pi_theta || pi_ref) = ||mean - mean_ref||^2 / (2 * sigma_step^2)
+                with torch.no_grad():
+                    ref_poses_reg_list, _ = self._run_decoder_ref(
+                        x_curr, t_val, ego_query, agents_query, bev_feature,
+                        bev_spatial_shape, status_encoding, bs, n_modes,
+                    )
+                    x_0_pred_ref = ref_poses_reg_list[-1][..., :2]
+                    x_0_pred_ref_norm = self.norm_odo(x_0_pred_ref)
+                    v_norm_ref = (x_0_pred_ref_norm - x_curr) / max(t_val, 1e-5)
+                    mean_ref = x_curr + v_norm_ref * dt
+
+                kl_drift = ((mean - mean_ref) ** 2).mean() / (2.0 * self.sigma_step ** 2)
+                kl_drift_per_step.append(kl_drift)
+
                 new_log_prob = self._gaussian_log_prob(x_next_sampled - mean)
                 new_log_probs.append(new_log_prob)
 
@@ -499,6 +540,7 @@ class FlowRLTrajectoryHead(nn.Module):
 
             new_log_probs = torch.stack(new_log_probs, dim=-1)
             il_loss = torch.stack(il_losses, dim=0).mean(dim=0)
+            kl_drift_loss = torch.stack(kl_drift_per_step).mean()
 
             # PPO clipped surrogate
             log_ratio = new_log_probs - old_log_probs.detach()
@@ -515,11 +557,12 @@ class FlowRLTrajectoryHead(nn.Module):
             has_positive = (adv > 0).any(dim=(1, 2))
             il_weight = torch.where(has_positive, torch.tensor(self.il_weight_positive, device=device), torch.tensor(self.il_weight_negative, device=device))
 
-            epoch_loss = rl_loss_per_batch + self.kl_coeff * kl_div + il_weight * il_loss
+            epoch_loss = rl_loss_per_batch + self.kl_coeff * kl_div + il_weight * il_loss + self.kl_ref_coeff * kl_drift_loss
             total_loss = total_loss + epoch_loss.mean()
             rl_loss_values.append(rl_loss_per_batch.mean())
             il_loss_values.append(il_loss.mean())
             kl_values.append(kl_div.mean())
+            kl_ref_values.append(kl_drift_loss)
 
         # Average over PPO epochs
         loss = total_loss / self.ppo_epochs
@@ -537,6 +580,7 @@ class FlowRLTrajectoryHead(nn.Module):
                 "rl_loss": torch.stack(rl_loss_values).mean(),
                 "il_loss": torch.stack(il_loss_values).mean(),
                 "kl_div": torch.stack(kl_values).mean(),
+                "kl_ref": torch.stack(kl_ref_values).mean(),
                 "mean_reward": rewards.mean(),
             },
         }
