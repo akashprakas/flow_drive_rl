@@ -2,15 +2,15 @@ import pandas as pd
 
 
 print("FlowDrive  navmini score ")
-df = pd.read_csv('/home/akash/learn/navsim/exp/flow_agent_pretrained_eval/2026.05.09.19.56.37/2026.05.09.20.03.49.csv')
+df = pd.read_csv('/home/akash/learn/navsim/exp/flow_agent_pretrained_eval/2026.05.19.08.53.30/2026.05.19.09.00.58.csv')
 print(df[df['valid']==True]['score'].describe())
 
 print("Diffusion drive navmini score ")
-df1 = pd.read_csv('/home/akash/learn/navsim/exp/diffusiondrive_pretrained_navmini/2026.05.09.20.40.07/2026.05.09.20.47.47.csv')
+df1 = pd.read_csv('/home/akash/learn/navsim/exp/diffusiondrive_pretrained_navmini/2026.05.19.09.20.11/2026.05.19.09.28.21.csv')
 print(df1[df1['valid']==True]['score'].describe())
 
 print("Velcity agent  drive navmini score ")
-df2 = pd.read_csv('/home/akash/learn/navsim/exp/constant_velocity_navmini/2026.05.09.20.52.23/2026.05.09.20.58.44.csv')
+df2 = pd.read_csv('/home/akash/learn/navsim/exp/constant_velocity_navmini/2026.05.19.09.20.22/2026.05.19.09.27.05.csv')
 print(df2[df2['valid']==True]['score'].describe())
 
 print("\n" + "="*60)
@@ -42,3 +42,58 @@ summary = {
                      df5[df5['valid']==True]['score'].mean() * 100],
 }
 print(pd.DataFrame(summary).to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+
+
+
+
+
+############################ nav mini trained rl 2 epochs ##############################
+
+print("\n" + "="*60)
+print("RL TRAINED MODEL (navmini, 2 epochs navtrain)")
+print("="*60)
+
+print("\nFlowRL navmini score (2 epochs RL training)")
+df_rl = pd.read_csv('/home/akash/learn/navsim/exp/flow_rl_navtrain_eval_mini/2026.05.18.20.15.12/2026.05.18.20.36.43.csv')
+print(f"Total rows: {len(df_rl)}, valid: {df_rl['valid'].sum()}, invalid: {(~df_rl['valid']).sum()}")
+print(df_rl[df_rl['valid']==True]['score'].describe())
+print(f"\nMean PDMS (valid only): {df_rl[df_rl['valid']==True]['score'].mean() * 100:.2f}")
+
+print("\n" + "="*60)
+print("UPDATED SUMMARY TABLE (navmini)")
+print("="*60)
+summary2 = {
+    "Agent":        ["DiffusionDrive", "FlowDrive (pretrained)", "FlowDrive RL (2ep)", "ConstVelocity"],
+    "navmini PDMS": [df1[df1['valid']==True]['score'].mean() * 100,
+                     df [df ['valid']==True]['score'].mean() * 100,
+                     df_rl[df_rl['valid']==True]['score'].mean() * 100,
+                     df2[df2['valid']==True]['score'].mean() * 100],
+}
+print(pd.DataFrame(summary2).to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+
+
+print("\n" + "="*60)
+print("RL TRAINED MODEL (navtest, 2 epochs navtrain)")
+print("="*60)
+
+print("\nFlowRL navtest score (2 epochs RL training)")
+df_rl_navtest = pd.read_csv('/home/akash/learn/navsim/exp/flow_rl_navtest_eval/2026.05.19.07.23.35/2026.05.19.15.34.58.csv')
+print(f"Total rows: {len(df_rl_navtest)}, valid: {df_rl_navtest['valid'].sum()}, invalid: {(~df_rl_navtest['valid']).sum()}")
+print(df_rl_navtest[df_rl_navtest['valid']==True]['score'].describe())
+print(f"\nMean PDMS (valid only): {df_rl_navtest[df_rl_navtest['valid']==True]['score'].mean() * 100:.2f}")
+
+print("\n" + "="*60)
+print("FULL SUMMARY TABLE (navmini + navtest)")
+print("="*60)
+summary3 = {
+    "Agent":        ["DiffusionDrive", "FlowDrive (pretrained)", "FlowDrive RL (2ep)", "ConstVelocity"],
+    "navmini PDMS": [df1[df1['valid']==True]['score'].mean() * 100,
+                     df [df ['valid']==True]['score'].mean() * 100,
+                     df_rl[df_rl['valid']==True]['score'].mean() * 100,
+                     df2[df2['valid']==True]['score'].mean() * 100],
+    "navtest PDMS": [df3[df3['valid']==True]['score'].mean() * 100,
+                     df4[df4['valid']==True]['score'].mean() * 100,
+                     df_rl_navtest[df_rl_navtest['valid']==True]['score'].mean() * 100,
+                     df5[df5['valid']==True]['score'].mean() * 100],
+}
+print(pd.DataFrame(summary3).to_string(index=False, float_format=lambda x: f"{x:.2f}"))

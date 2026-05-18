@@ -151,6 +151,89 @@ def _pairwise_scores(scorer) -> np.ndarray:
     return final_scores.astype(np.float32)                       # (G,)
 
 
+# --- Persistent process pool for parallel PDM reward scoring ---
+# ProcessPoolExecutor bypasses the Python GIL, giving true CPU parallelism for
+# the shapely/numpy-heavy PDM scoring.
+# * spawn context: child processes start fresh (safe when parent has a CUDA context)
+# * initializer: pre-imports heavy modules so the first real task has no cold-start
+# * Pool is created lazily on first use and kept alive for the process lifetime
+_PDM_N_WORKERS: int = 8  # one process per batch item at batch_size=8
+_pdm_executor = None  # type: Optional[object]  # ProcessPoolExecutor
+
+
+def _pdm_worker_init():
+    """Pre-import expensive navsim/nuplan modules in each worker process."""
+    # Importing flow_rl_model itself would be circular; import just the deps we need.
+    import lzma as _lzma  # noqa: F401
+    import pickle as _pkl  # noqa: F401
+    import numpy as _np  # noqa: F401
+    from navsim.evaluate.pdm_score import pdm_score_para as _ps  # noqa: F401
+    from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer as _SC  # noqa: F401
+    from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator as _SIM  # noqa: F401
+
+
+def _get_pdm_executor():
+    """Return the persistent ProcessPoolExecutor, creating it on first call."""
+    global _pdm_executor
+    if _pdm_executor is None:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        ctx = multiprocessing.get_context("spawn")
+        _pdm_executor = ProcessPoolExecutor(
+            max_workers=_PDM_N_WORKERS,
+            mp_context=ctx,
+            initializer=_pdm_worker_init,
+        )
+    return _pdm_executor
+
+
+def _score_one_item(args):
+    """Score one batch item in a worker process. No shared state with parent.
+
+    Creates PDMSimulator/PDMScorer locally — cheap since they hold only config.
+
+    Args:
+        args: (cache_path, pred_trajs [N,8,3], gt_traj [8,3],
+               scoring_config PDMScorerConfig, proposal_sampling TrajectorySampling)
+
+    Returns:
+        (scores np.ndarray [N+1], subscores dict[str, np.ndarray [N+1]])
+        Index 0..N-1 = model predictions, index N = GT trajectory.
+    """
+    import lzma as _lzma
+    import pickle as _pkl
+    import numpy as _np
+    from navsim.evaluate.pdm_score import pdm_score_para
+    from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer
+    from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
+
+    cache_path, pred_trajs, gt_traj, scoring_config, proposal_sampling = args
+
+    simulator = PDMSimulator(proposal_sampling)
+    scorer = PDMScorer(proposal_sampling, scoring_config)
+
+    with _lzma.open(str(cache_path), "rb") as f:
+        metric_cache = _pkl.load(f)
+
+    all_trajs = _np.concatenate([pred_trajs, gt_traj[None]], axis=0)  # [N+1, 8, 3]
+    _ = pdm_score_para(
+        metric_cache=metric_cache,
+        model_trajectory=all_trajs,
+        future_sampling=proposal_sampling,
+        simulator=simulator,
+        scorer=scorer,
+    )
+    # Re-import helpers since _pairwise_scores/_pairwise_subscores are defined
+    # in this module; they are available because the worker imported flow_rl_model.
+    from navsim.agents.flow_drive_agent.flow_rl_model import (
+        _pairwise_scores,
+        _pairwise_subscores,
+    )
+    scores = _pairwise_scores(scorer)
+    subscores = _pairwise_subscores(scorer)
+    return scores, subscores
+
+
 class FlowRLTransfuserModel(nn.Module):
     """Flow matching model with RL training capability."""
 
@@ -241,10 +324,10 @@ class FlowRLTrajectoryHead(nn.Module):
         self.ego_fut_mode = 20
 
         # RL parameters
-        self.num_groups = 2
+        self.num_groups = 4
         self.n_steps = 5
-        self.sigma_init = 0.05
-        self.sigma_step = 0.02
+        self.sigma_init = 0.15
+        self.sigma_step = 0.05
         self.temporal_discount = 0.8
         self.il_weight_positive = 0.8
         self.il_weight_negative = 1.0
@@ -270,7 +353,7 @@ class FlowRLTrajectoryHead(nn.Module):
         self._ref_diff_decoder.requires_grad_(False)
         self.kl_ref_coeff = 0.1
 
-        # PDM scorer for reward computation
+        # PDM scorer for reward computation (used to pass config/sampling to worker threads)
         proposal_sampling = TrajectorySampling(time_horizon=4.0, interval_length=0.1)
         self._simulator = PDMSimulator(proposal_sampling)
         self._scorer = PDMScorer(proposal_sampling)
@@ -338,44 +421,41 @@ class FlowRLTrajectoryHead(nn.Module):
 
     def _compute_pdm_rewards(self, trajectories, metric_cache_path, targets):
         """Score trajectories using PDM. trajectories: [B, N, 8, 3] in world coords.
+
+        Batch items are scored in parallel via a persistent ThreadPoolExecutor.
+        Each worker thread reuses its own PDMSimulator/PDMScorer (thread-local),
+        so there is no shared mutable state and no per-step construction overhead.
+
         Returns: proposal_scores [B, N], gt_scores [B], sub_rewards_list
         """
         bs = trajectories.shape[0]
+
+        args_list = []
+        for b in range(bs):
+            cache_path = metric_cache_path[b] if isinstance(metric_cache_path, (list, tuple)) else metric_cache_path
+            gt_traj = targets["trajectory"][b].cpu().numpy()   # [8, 3]
+            pred_trajs = trajectories[b].cpu().numpy()          # [N, 8, 3]
+            args_list.append((
+                cache_path,
+                pred_trajs,
+                gt_traj,
+                self._scorer._config,
+                self._simulator.proposal_sampling,
+            ))
+
+        executor = _get_pdm_executor()
+        results = list(executor.map(_score_one_item, args_list))
+
         all_proposal_scores = []
         all_gt_scores = []
         all_subscores = []
-
-        for b in range(bs):
-            cache_path = metric_cache_path[b] if isinstance(metric_cache_path, (list, tuple)) else metric_cache_path
-            with lzma.open(str(cache_path), "rb") as f:
-                metric_cache = pickle.load(f)
-
-            # Include GT as last trajectory for comparison
-            gt_traj = targets["trajectory"][b].cpu().numpy()  # [8, 3]
-            pred_trajs = trajectories[b].cpu().numpy()  # [N, 8, 3]
-            all_trajs = np.concatenate([pred_trajs, gt_traj[None]], axis=0)  # [N+1, 8, 3]
-
-            # Side-effect only: populates self._scorer internal state
-            # (_multi_metrics, _weighted_metrics, _progress_raw)
-            # for _pairwise_scores to extract GT-relative scores from.
-            _ = pdm_score_para(
-                metric_cache=metric_cache,
-                model_trajectory=all_trajs,
-                future_sampling=self._simulator.proposal_sampling,
-                simulator=self._simulator,
-                scorer=self._scorer,
-            )
-
-            scores = _pairwise_scores(self._scorer)  # [N+1] (proposals + GT vs pdm_trajectory)
-            subscores = _pairwise_subscores(self._scorer)
-
-            # Separate proposal scores from GT score
+        for scores, subscores in results:
+            # scores: [N+1] — model predictions (0..N-1) + GT (N)
             proposal_scores = scores[:-1]  # [N]
-            gt_score = scores[-1]  # scalar
-
+            gt_score = scores[-1]          # scalar
             all_proposal_scores.append(proposal_scores)
             all_gt_scores.append(gt_score)
-            all_subscores.append({k: v[:-1] for k, v in subscores.items()})  # exclude GT from subscores
+            all_subscores.append({k: v[:-1] for k, v in subscores.items()})  # exclude GT
 
         proposal_scores_tensor = torch.tensor(np.stack(all_proposal_scores), dtype=torch.float32, device=trajectories.device)
         gt_scores_tensor = torch.tensor(np.array(all_gt_scores), dtype=torch.float32, device=trajectories.device)

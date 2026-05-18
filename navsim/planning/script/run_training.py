@@ -65,6 +65,7 @@ def build_datasets(cfg: DictConfig, agent: AbstractAgent) -> Tuple[Dataset, Data
         target_builders=agent.get_target_builders(),
         cache_path=cfg.cache_path,
         force_cache_computation=cfg.force_cache_computation,
+        metric_cache_path=cfg.get("metric_cache_path", None),
     )
 
     val_data = Dataset(
@@ -73,6 +74,7 @@ def build_datasets(cfg: DictConfig, agent: AbstractAgent) -> Tuple[Dataset, Data
         target_builders=agent.get_target_builders(),
         cache_path=cfg.cache_path,
         force_cache_computation=cfg.force_cache_computation,
+        metric_cache_path=cfg.get("metric_cache_path", None),
     )
 
     return train_data, val_data

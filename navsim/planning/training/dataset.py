@@ -156,6 +156,7 @@ class Dataset(torch.utils.data.Dataset):
         target_builders: List[AbstractTargetBuilder],
         cache_path: Optional[str] = None,
         force_cache_computation: bool = False,
+        metric_cache_path: Optional[str] = None,
     ):
         super().__init__()
         self._scene_loader = scene_loader
@@ -164,6 +165,7 @@ class Dataset(torch.utils.data.Dataset):
 
         self._cache_path: Optional[Path] = Path(cache_path) if cache_path else None
         self._force_cache_computation = force_cache_computation
+        self._metric_cache_path = Path(metric_cache_path) if metric_cache_path else None
         self._valid_cache_paths: Dict[str, Path] = self._load_valid_caches(
             self._cache_path, feature_builders, target_builders
         )
@@ -297,18 +299,28 @@ class Dataset(torch.utils.data.Dataset):
         features: Dict[str, torch.Tensor] = {}
         targets: Dict[str, torch.Tensor] = {}
 
+        log_name = None
+
         if self._cache_path is not None:
             assert (
                 token in self._valid_cache_paths.keys()
             ), f"The token {token} has not been cached yet, please call cache_dataset first!"
 
             features, targets = self._load_scene_with_token(token)
+            log_name = self._valid_cache_paths[token].parent.name
         else:
             scene = self._scene_loader.get_scene_from_token(self._scene_loader.tokens[idx])
+            log_name = scene.scene_metadata.log_name
             agent_input = scene.get_agent_input()
             for builder in self._feature_builders:
                 features.update(builder.compute_features(agent_input))
             for builder in self._target_builders:
                 targets.update(builder.compute_targets(scene))
+
+        if self._metric_cache_path is not None:
+            sample_metric_path = str(
+                self._metric_cache_path / log_name / "unknown" / token / "metric_cache.pkl"
+            )
+            return features, targets, sample_metric_path, token
 
         return (features, targets)

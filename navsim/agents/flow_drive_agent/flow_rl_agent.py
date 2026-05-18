@@ -16,6 +16,7 @@ from navsim.planning.training.abstract_feature_target_builder import AbstractFea
 from navsim.agents.diffusiondrive.modules.scheduler import WarmupCosLR
 from omegaconf import DictConfig, OmegaConf, open_dict
 import torch.optim as optim
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 
 def build_from_configs(obj, cfg: DictConfig, **kwargs):
@@ -67,6 +68,15 @@ class FlowRLAgent(AbstractAgent):
                 print(f"Missing keys: {missing_keys}")
             if unexpected_keys:
                 print(f"Unexpected keys: {unexpected_keys}")
+
+            # Re-sync _ref_diff_decoder to the loaded diff_decoder weights.
+            # The deep-copy in FlowRLTrajectoryHead.__init__ runs before the checkpoint
+            # is loaded, so _ref_diff_decoder must be re-initialised here.
+            head = self._transfuser_model._trajectory_head
+            if hasattr(head, '_ref_diff_decoder') and hasattr(head, 'diff_decoder'):
+                import copy
+                head._ref_diff_decoder.load_state_dict(head.diff_decoder.state_dict())
+                print("_ref_diff_decoder synced to loaded diff_decoder weights.")
         else:
             print("No checkpoint path provided. Initializing from scratch.")
 
@@ -131,4 +141,10 @@ class FlowRLAgent(AbstractAgent):
         return {'optimizer': optimizer, 'lr_scheduler': scheduler}
 
     def get_training_callbacks(self) -> List[pl.Callback]:
-        return [TransfuserCallback(self._config)]
+        checkpoint_callback = ModelCheckpoint(
+            every_n_epochs=1,
+            save_top_k=-1,
+            filename="epoch={epoch:02d}-step={step}",
+            save_last=True,
+        )
+        return [TransfuserCallback(self._config), checkpoint_callback]
