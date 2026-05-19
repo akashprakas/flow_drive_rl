@@ -1,11 +1,13 @@
 """Flow matching model with GRPO/REINFORCE RL training.
 
-Uses Gaussian Euler steps for stochastic policy:
-  x_{next} = x_t + v_theta * dt + sigma_step * z
-  log_prob = -0.5 * ||z||^2
+Uses Gaussian Euler steps for stochastic policy with time-dependent noise:
+  sigma_t = sigma_base * sqrt(t / (1-t))   (marginal-preserving SDE, Flow-GRPO Eq. 8)
+  x_{next} = mean * (1 + sigma_t * z)      (multiplicative, DDV2-style)
+  log_prob = -0.5 * ||z||^2  (where z = (x_next - mean) / (sigma_t * |mean|))
 """
 from typing import Dict, List, Optional
 import copy
+import math
 import numpy as np
 import pickle
 import lzma
@@ -326,13 +328,12 @@ class FlowRLTrajectoryHead(nn.Module):
         # RL parameters
         self.num_groups = 4
         self.n_steps = 5
-        self.sigma_init = 0.15
-        self.sigma_step = 0.05
+        self.t_start = 0.15
+        self.sigma_base = 0.12
         self.temporal_discount = 0.8
-        self.il_weight_positive = 0.8
-        self.il_weight_negative = 1.0
         self.clip_ratio = 0.1
         self.kl_coeff = 0.1
+        self.il_coeff = 0.5
         # Multiple PPO optimizer epochs require manual optimization; in automatic
         # Lightning mode, replaying here only duplicates the same backward pass.
         self.ppo_epochs = 1
@@ -348,7 +349,7 @@ class FlowRLTrajectoryHead(nn.Module):
         self.loss_computer = LossComputer(config)
 
         # Frozen reference decoder for drift-MSE KL (Flow-GRPO regularization)
-        # KL(pi_theta || pi_ref) = ||mean_new - mean_ref||^2 / (2 * sigma_step^2)
+        # KL(pi_theta || pi_ref) = ||mean_new - mean_ref||^2 / (2 * sigma_t^2)
         self._ref_diff_decoder = copy.deepcopy(self.diff_decoder)
         self._ref_diff_decoder.requires_grad_(False)
         self.kl_ref_coeff = 0.1
@@ -379,7 +380,7 @@ class FlowRLTrajectoryHead(nn.Module):
             if targets is None:
                 raise ValueError("FlowRL training requires targets for IL regularization and GT reward comparison.")
             return self.forward_train_rl(ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, targets, metric_cache_path)
-        return self.forward_test(ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding)
+        return self.forward_test(ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, targets=targets)
 
     def _run_decoder(self, x_t_norm, t_val, ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, bs, n_modes):
         """Run decoder on current noisy state, return predicted clean trajectory."""
@@ -415,9 +416,96 @@ class FlowRLTrajectoryHead(nn.Module):
         )
         return poses_reg_list, poses_cls_list
 
-    def _gaussian_log_prob(self, diff):
-        """Gaussian transition log-prob up to constants shared by old/new policies."""
-        return -0.5 * ((diff / self.sigma_step) ** 2).sum(dim=(-2, -1))
+    def _sigma_t(self, t_val):
+        """Time-dependent noise scale following the marginal-preserving SDE schedule.
+
+        sigma_t = sigma_base * sqrt(t / (1-t)), matching Flow-GRPO Eq. 8.
+        At t=0.15: 0.12 * sqrt(0.176) = 0.050
+        At t=0.03: 0.12 * sqrt(0.031) = 0.021
+        """
+        return self.sigma_base * math.sqrt(t_val / (1.0 - t_val))
+
+    def _latent_log_prob(self, z):
+        """Standard normal log-prob on the 2D latent z ~ N(0, I).
+
+        Args:
+            z: [B, N, 1, 2] — the two latent random variables per mode.
+        Returns:
+            [B, N] — log-prob per mode (sum over the 2 independent coordinates).
+        """
+        return -0.5 * (z ** 2).sum(dim=(-2, -1))
+
+    def _infer_z(self, x_next_sampled, mean, sigma_t):
+        """Infer the latent z that would produce x_next_sampled under the current mean.
+
+        Inverts: x_next = mean * (1 + sigma_t * z_broadcast)
+        Solves:  z = (x_next / mean - 1) / sigma_t
+
+        Since z is shared across waypoints [B, N, 1, 2], we average the inferred
+        z across the 8 waypoints to get a robust estimate. The result is clamped
+        to [-5, 5] to prevent overflow when mean is near zero but x_next is not.
+
+        Note: this is a latent-likelihood surrogate, not an exact trajectory density.
+        The shared-noise transform maps 2 latent dims into 16D trajectory state,
+        making the true trajectory density singular. The latent formulation gives
+        correct PPO gradients for policy improvement despite this.
+
+        Args:
+            x_next_sampled: [B, N, 8, 2]
+            mean: [B, N, 8, 2]
+            sigma_t: scalar
+
+        Returns:
+            z_inferred: [B, N, 1, 2], clamped to [-5, 5]
+        """
+        safe_mean = mean.clone()
+        safe_mean[safe_mean.abs() < 1e-4] = 1e-4 * safe_mean[safe_mean.abs() < 1e-4].sign()
+        safe_mean[safe_mean == 0] = 1e-4
+        z_per_wp = (x_next_sampled / safe_mean - 1.0) / sigma_t
+        z_inferred = z_per_wp.mean(dim=-2, keepdim=True)  # [B, N, 1, 2]
+        z_inferred = z_inferred.clamp(-5.0, 5.0)
+        return z_inferred
+
+    def _bezier_xyyaw(self, xy8: torch.Tensor) -> torch.Tensor:
+        """Compute heading from Bézier curve tangent direction (same as DDV2).
+
+        Treats the 8 waypoints as control points, prepends (0,0) as origin,
+        computes the analytical derivative of the 8th-order Bézier curve,
+        and derives yaw = atan2(dy, dx) at each waypoint.
+
+        Args:
+            xy8: [B, N, 8, 2] — x,y positions in world coordinates.
+        Returns:
+            [B, N, 8, 3] — x, y, yaw (radians).
+        """
+        B, N, T, _ = xy8.shape
+        device, dtype = xy8.device, xy8.dtype
+
+        origin = torch.zeros(B, N, 1, 2, device=device, dtype=dtype)
+        ctrl = torch.cat([origin, xy8], dim=-2)  # [B, N, 9, 2]
+        n = ctrl.shape[-2] - 1  # 8
+
+        delta = ctrl[..., 1:, :] - ctrl[..., :-1, :]  # [B, N, 8, 2]
+
+        binom = torch.tensor(
+            [math.comb(n - 1, i) for i in range(n)], device=device, dtype=dtype
+        )  # (8,)
+
+        t = torch.arange(1, n + 1, device=device, dtype=dtype) / n  # (8,)
+
+        t_pow = t.view(-1, 1) ** torch.arange(0, n, device=device, dtype=dtype)
+        one_pow = (1 - t).view(-1, 1) ** torch.arange(n - 1, -1, -1, device=device, dtype=dtype)
+        basis = binom * t_pow * one_pow  # (8, 8)
+
+        delta_exp = delta.unsqueeze(-3)  # [B, N, 1, 8, 2]
+        basis_exp = basis.view(1, 1, 8, 8, 1)  # [1, 1, 8, 8, 1]
+
+        deriv = n * (delta_exp * basis_exp).sum(dim=-2)  # [B, N, 8, 2]
+
+        dx, dy = deriv[..., 0], deriv[..., 1]
+        yaw = torch.atan2(dy, dx).unsqueeze(-1)  # [B, N, 8, 1]
+
+        return torch.cat([xy8, yaw], dim=-1)  # [B, N, 8, 3]
 
     def _compute_pdm_rewards(self, trajectories, metric_cache_path, targets):
         """Score trajectories using PDM. trajectories: [B, N, 8, 3] in world coords.
@@ -517,19 +605,21 @@ class FlowRLTrajectoryHead(nn.Module):
             plan_anchor = plan_anchor.reshape(bs, G * self.ego_fut_mode, 8, 2)  # [B, G*20, 8, 2]
             x_0_norm = self.norm_odo(plan_anchor)
 
-            # Initial noise: additive per-waypoint (more exploration for small G)
-            # For full navtrain with G=4, consider switching to multiplicative
-            noise = torch.randn_like(x_0_norm)
-            x_t = (1 - self.sigma_init) * x_0_norm + self.sigma_init * noise
+            # Initial multiplicative noise: per-mode, shared across waypoints (DDV2-style)
+            # This scales each trajectory coherently rather than adding independent per-waypoint jitter
+            noise_x = torch.randn(bs, G * self.ego_fut_mode, 1, 1, device=device) * self.t_start + 1.0
+            noise_y = torch.randn(bs, G * self.ego_fut_mode, 1, 1, device=device) * self.t_start + 1.0
+            noise_mul = torch.cat([noise_x, noise_y], dim=-1).expand_as(x_0_norm)  # [B, G*20, 8, 2]
+            x_t = x_0_norm * noise_mul
             x_t = torch.clamp(x_t, -1, 1)
 
-            dt = self.sigma_init / self.n_steps
+            dt = self.t_start / self.n_steps
             chain_states = [x_t.clone()]
             sampled_next_states = []
             old_log_probs = []
 
             for step in range(self.n_steps):
-                t_val = self.sigma_init - step * dt  # decreasing: 0.05, 0.04, ...
+                t_val = self.t_start - step * dt  # decreasing: 0.15, 0.12, ...
 
                 # Decoder predicts clean trajectory
                 poses_reg_list, poses_cls_list = self._run_decoder(
@@ -541,21 +631,28 @@ class FlowRLTrajectoryHead(nn.Module):
                 # Velocity: direction toward predicted clean sample
                 v_norm = (x_0_pred_norm - x_t) / max(t_val, 1e-5)
 
-                # Stochastic Euler step. The next decoder state is clamped, but
-                # PPO must score the unclamped Gaussian sample that was drawn.
+                # Time-dependent noise: more exploration at high t, less at low t
+                sigma_t = self._sigma_t(t_val)
+
+                # Multiplicative Euler step (DDV2-style): per-mode noise shared across waypoints
+                # This preserves trajectory shape while exploring speed/lateral scaling
                 mean = x_t + v_norm * dt
-                z = torch.randn_like(x_t)
-                x_next_sampled = mean + self.sigma_step * z
+                z_x = torch.randn(bs, n_modes, 1, 1, device=device)
+                z_y = torch.randn(bs, n_modes, 1, 1, device=device)
+                z_latent = torch.cat([z_x, z_y], dim=-1)  # [B, G*20, 1, 2]
+                z_mul = z_latent.expand_as(mean)  # [B, G*20, 8, 2]
+                x_next_sampled = mean * (1.0 + sigma_t * z_mul)
                 x_next = torch.clamp(x_next_sampled, -1, 1)
 
-                log_prob = self._gaussian_log_prob(x_next_sampled - mean)  # [B, G*20]
+                log_prob = self._latent_log_prob(z_latent)  # [B, G*20]
                 old_log_probs.append(log_prob)
                 sampled_next_states.append(x_next_sampled.clone())
                 chain_states.append(x_next.clone())
                 x_t = x_next
 
-            # Final trajectory from last decoder pass (with heading)
-            final_traj = poses_reg_list[-1]  # [B, G*20, 8, 3]
+            # Final trajectory: recompute heading from x,y geometry (DDV2-style Bézier tangent)
+            final_xy = poses_reg_list[-1][..., :2]  # [B, G*20, 8, 2]
+            final_traj = self._bezier_xyyaw(final_xy)  # [B, G*20, 8, 3]
             final_cls = poses_cls_list[-1]  # [B, G*20]... actually [B, n_modes]
 
             # PDM scoring
@@ -568,22 +665,28 @@ class FlowRLTrajectoryHead(nn.Module):
             old_log_probs = torch.stack(old_log_probs, dim=-1)
 
         # === PASS 2: PPO loss on stored rollouts ===
-        dt = self.sigma_init / self.n_steps
+        dt = self.t_start / self.n_steps
         adv = advantages.detach()
-        target_traj = targets["trajectory"].unsqueeze(1).expand(-1, n_modes, -1, -1)
         total_loss = torch.zeros((), device=device)
         rl_loss_values = []
         il_loss_values = []
         kl_values = []
         kl_ref_values = []
 
+        # WTA IL: find closest anchor mode per batch element (only that mode gets IL gradient)
+        with torch.no_grad():
+            anchor_dist = torch.linalg.norm(
+                targets["trajectory"][:, None, :, :2] - self.plan_anchor[None, :, :, :], dim=-1
+            ).mean(dim=-1)  # [B, 20]
+            best_mode = anchor_dist.argmin(dim=-1)  # [B]
+
         for ppo_epoch in range(self.ppo_epochs):
             new_log_probs = []
-            il_losses = []
             kl_drift_per_step = []
+            il_losses = []
 
             for step in range(self.n_steps):
-                t_val = self.sigma_init - step * dt
+                t_val = self.t_start - step * dt
                 x_curr = chain_states[step].detach()
                 x_next_sampled = sampled_next_states[step].detach()
 
@@ -596,8 +699,11 @@ class FlowRLTrajectoryHead(nn.Module):
                 v_norm = (x_0_pred_norm - x_curr) / max(t_val, 1e-5)
                 mean = x_curr + v_norm * dt
 
+                # Time-dependent noise (must match rollout)
+                sigma_t = self._sigma_t(t_val)
+
                 # Drift-MSE KL to frozen reference decoder
-                # KL(pi_theta || pi_ref) = ||mean - mean_ref||^2 / (2 * sigma_step^2)
+                # Uses constant sigma_t^2 denominator (stable, avoids explosion near zero coords)
                 with torch.no_grad():
                     ref_poses_reg_list, _ = self._run_decoder_ref(
                         x_curr, t_val, ego_query, agents_query, bev_feature,
@@ -608,23 +714,30 @@ class FlowRLTrajectoryHead(nn.Module):
                     v_norm_ref = (x_0_pred_ref_norm - x_curr) / max(t_val, 1e-5)
                     mean_ref = x_curr + v_norm_ref * dt
 
-                kl_drift = ((mean - mean_ref) ** 2).mean() / (2.0 * self.sigma_step ** 2)
+                kl_drift = ((mean - mean_ref) ** 2).mean() / (2.0 * sigma_t ** 2)
                 kl_drift_per_step.append(kl_drift)
 
-                new_log_prob = self._gaussian_log_prob(x_next_sampled - mean)
+                # Infer latent z from stored x_next_sampled under new mean, score under N(0,I)
+                z_inferred = self._infer_z(x_next_sampled, mean, sigma_t)  # [B, N, 1, 2]
+                new_log_prob = self._latent_log_prob(z_inferred)  # [B, N]
                 new_log_probs.append(new_log_prob)
 
+                # WTA IL: only regularize the closest-to-GT mode (across G groups)
                 for poses_reg in poses_reg_list:
-                    traj_l1 = F.l1_loss(poses_reg[..., :2], target_traj[..., :2], reduction='none')
-                    il_losses.append(traj_l1.mean(dim=(1, 2, 3)))
+                    poses_reshaped = poses_reg.view(bs, G, N, 8, 3)  # [B, G, 20, 8, 3]
+                    idx = best_mode[:, None, None, None, None].expand(-1, G, 1, 8, 3)
+                    best_mode_pred = poses_reshaped.gather(2, idx).squeeze(2)  # [B, G, 8, 3]
+                    traj_l1 = F.l1_loss(best_mode_pred[..., :2], targets["trajectory"][:, None, :, :2], reduction='mean')
+                    il_losses.append(traj_l1)
 
             new_log_probs = torch.stack(new_log_probs, dim=-1)
-            il_loss = torch.stack(il_losses, dim=0).mean(dim=0)
             kl_drift_loss = torch.stack(kl_drift_per_step).mean()
+            il_loss = torch.stack(il_losses).mean()
 
             # PPO clipped surrogate
-            log_ratio = new_log_probs - old_log_probs.detach()
-            ratio = torch.exp(log_ratio.clamp(-20.0, 20.0))
+            log_ratio_raw = new_log_probs - old_log_probs.detach()
+            log_ratio = log_ratio_raw.clamp(-5.0, 5.0)
+            ratio = torch.exp(log_ratio)
 
             clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio)
             per_token_loss = -torch.min(ratio * adv, clipped_ratio * adv)
@@ -634,13 +747,10 @@ class FlowRLTrajectoryHead(nn.Module):
 
             kl_div = (ratio - 1.0 - log_ratio).mean(dim=(1, 2))
 
-            has_positive = (adv > 0).any(dim=(1, 2))
-            il_weight = torch.where(has_positive, torch.tensor(self.il_weight_positive, device=device), torch.tensor(self.il_weight_negative, device=device))
-
-            epoch_loss = rl_loss_per_batch + self.kl_coeff * kl_div + il_weight * il_loss + self.kl_ref_coeff * kl_drift_loss
+            epoch_loss = rl_loss_per_batch + self.kl_coeff * kl_div + self.kl_ref_coeff * kl_drift_loss + self.il_coeff * il_loss
             total_loss = total_loss + epoch_loss.mean()
             rl_loss_values.append(rl_loss_per_batch.mean())
-            il_loss_values.append(il_loss.mean())
+            il_loss_values.append(il_loss)
             kl_values.append(kl_div.mean())
             kl_ref_values.append(kl_drift_loss)
 
@@ -653,19 +763,24 @@ class FlowRLTrajectoryHead(nn.Module):
             mode_idx_exp = mode_idx[..., None, None, None].repeat(1, 1, self._num_poses, 3)
             best_reg = torch.gather(final_traj, 1, mode_idx_exp).squeeze(1)
 
+        # Diagnostic: fraction of log-ratios that hit the clamp (indicates z saturation)
+        with torch.no_grad():
+            clamp_frac = (log_ratio_raw.abs() > 5.0).float().mean()
+
         return {
             "trajectory": best_reg,
             "trajectory_loss": loss,
             "trajectory_loss_dict": {
                 "rl_loss": torch.stack(rl_loss_values).mean(),
-                "il_loss": torch.stack(il_loss_values).mean(),
+                "il_loss_wta": torch.stack(il_loss_values).mean(),
                 "kl_div": torch.stack(kl_values).mean(),
                 "kl_ref": torch.stack(kl_ref_values).mean(),
                 "mean_reward": rewards.mean(),
+                "log_ratio_clamp_frac": clamp_frac,
             },
         }
 
-    def forward_test(self, ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding):
+    def forward_test(self, ego_query, agents_query, bev_feature, bev_spatial_shape, status_encoding, targets=None):
         """Deterministic inference — same as flow IL model."""
         bs = ego_query.shape[0]
         device = ego_query.device
@@ -694,7 +809,16 @@ class FlowRLTrajectoryHead(nn.Module):
 
         poses_reg = poses_reg_list[-1]
         poses_cls = poses_cls_list[-1]
+
+        # Recompute heading from x,y geometry (Bézier tangent, same as training)
+        poses_xy = poses_reg[..., :2]  # [B, 20, 8, 2]
+        poses_with_yaw = self._bezier_xyyaw(poses_xy)  # [B, 20, 8, 3]
+
         mode_idx = poses_cls.argmax(dim=-1)
         mode_idx = mode_idx[..., None, None, None].repeat(1, 1, self._num_poses, 3)
-        best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
-        return {"trajectory": best_reg}
+        best_reg = torch.gather(poses_with_yaw, 1, mode_idx).squeeze(1)
+
+        output = {"trajectory": best_reg}
+        if targets is not None:
+            output["trajectory_loss"] = F.l1_loss(best_reg, targets["trajectory"])
+        return output

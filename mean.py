@@ -97,3 +97,39 @@ summary3 = {
                      df5[df5['valid']==True]['score'].mean() * 100],
 }
 print(pd.DataFrame(summary3).to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+
+#### rl with multiplicative noise wta
+print("\n" + "="*60)
+print("RL v2 (navtest, multiplicative noise / rl likelihood / wta)")
+print("="*60)
+
+print("\nFlowRL v2 navtest score")
+df_rl2_navtest = pd.read_csv('/home/akash/learn/navsim/exp/flow_rl_navtest_eval/2026.05.20.07.39.05/2026.05.20.16.16.41.csv')
+print(f"Total rows: {len(df_rl2_navtest)}, valid: {df_rl2_navtest['valid'].sum()}, invalid: {(~df_rl2_navtest['valid']).sum()}")
+print(df_rl2_navtest[df_rl2_navtest['valid']==True]['score'].describe())
+print(f"\nMean PDMS (valid only): {df_rl2_navtest[df_rl2_navtest['valid']==True]['score'].mean() * 100:.2f}")
+
+print("\nFlowRL v2 navmini score")
+df_rl2_navmini = pd.read_csv('/home/akash/learn/navsim/exp/flow_rl_navtest_eval/2026.05.20.19.14.16/2026.05.20.19.39.06.csv')
+print(f"Total rows: {len(df_rl2_navmini)}, valid: {df_rl2_navmini['valid'].sum()}, invalid: {(~df_rl2_navmini['valid']).sum()}")
+print(df_rl2_navmini[df_rl2_navmini['valid']==True]['score'].describe())
+print(f"\nMean PDMS (valid only): {df_rl2_navmini[df_rl2_navmini['valid']==True]['score'].mean() * 100:.2f}")
+
+print("\n" + "="*60)
+print("FULL SUMMARY TABLE (navmini + navtest, all variants)")
+print("="*60)
+summary4 = {
+    "Agent":        ["DiffusionDrive", "FlowDrive (pretrained)", "FlowRL 2ep", "FlowRL v2", "ConstVelocity"],
+    "navmini PDMS": [df1[df1['valid']==True]['score'].mean() * 100,
+                     df [df ['valid']==True]['score'].mean() * 100,
+                     df_rl[df_rl['valid']==True]['score'].mean() * 100,
+                     df_rl2_navmini[df_rl2_navmini['valid']==True]['score'].mean() * 100,
+                     df2[df2['valid']==True]['score'].mean() * 100],
+    "navtest PDMS": [df3[df3['valid']==True]['score'].mean() * 100,
+                     df4[df4['valid']==True]['score'].mean() * 100,
+                     df_rl_navtest[df_rl_navtest['valid']==True]['score'].mean() * 100,
+                     df_rl2_navtest[df_rl2_navtest['valid']==True]['score'].mean() * 100,
+                     df5[df5['valid']==True]['score'].mean() * 100],
+}
+print(pd.DataFrame(summary4).to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+
