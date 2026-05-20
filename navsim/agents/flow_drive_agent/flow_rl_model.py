@@ -333,7 +333,7 @@ class FlowRLTrajectoryHead(nn.Module):
         self.temporal_discount = 0.8
         self.clip_ratio = 0.1
         self.kl_coeff = 0.1
-        self.il_coeff = 0.5
+        self.il_coeff = 0.1
         # Multiple PPO optimizer epochs require manual optimization; in automatic
         # Lightning mode, replaying here only duplicates the same backward pass.
         self.ppo_epochs = 1

@@ -31,7 +31,7 @@ use_cache_without_dataset: true
 # Dataloader
 dataloader:
   params:
-    batch_size: 8
+    batch_size: 32
     num_workers: 4
     pin_memory: true
     prefetch_factor: 2
